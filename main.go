@@ -173,10 +173,10 @@ func main() {
 		Action: Do,
 		Flags: []cli.Flag{
 			&cli.StringFlag{
-				Name:     "schedule",
-				Usage:    "Schedule for backups",
-				Required: true,
-				EnvVars:  []string{"PB_SCHEDULE"},
+				Name:    "schedule",
+				Usage:   "Schedule for backups",
+				Value:   "@daily",
+				EnvVars: []string{"PB_SCHEDULE"},
 			},
 			&cli.StringFlag{
 				Name:     "endpoint",
