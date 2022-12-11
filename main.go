@@ -40,25 +40,38 @@ func registerExitHandler(done chan bool) {
 }
 
 type Backuper struct {
-	cli   *client.Client
-	ctx   context.Context
-	log   *log.Logger
-	cron  *cron.Cron
-	minio *minio.Client
+	cli     *client.Client
+	ctx     context.Context
+	log     *log.Logger
+	cron    *cron.Cron
+	minio   *minio.Client
+	options *BackuperOptions
 }
 
-func NewBackuper(minioEndpoint string, minioOptions *minio.Options) Backuper {
+type BackuperOptions struct {
+	minio    *MinioBackuperOptions
+	schedule string
+}
+
+type MinioBackuperOptions struct {
+	endpoint     string
+	bucket       string
+	minioOptions *minio.Options
+}
+
+func NewBackuper(options *BackuperOptions) Backuper {
 	dockerCli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		panic(fmt.Sprintln("Could not create Docker client:", err))
 	}
-	minioClient, err := minio.New(minioEndpoint, minioOptions)
+	minioClient, err := minio.New(options.minio.endpoint, options.minio.minioOptions)
 	return Backuper{
-		ctx:   context.Background(),
-		cli:   dockerCli,
-		log:   log.Default(),
-		cron:  cron.New(),
-		minio: minioClient,
+		ctx:     context.Background(),
+		cli:     dockerCli,
+		log:     log.Default(),
+		cron:    cron.New(),
+		minio:   minioClient,
+		options: options,
 	}
 }
 
@@ -71,7 +84,7 @@ func (b *Backuper) Run(done chan bool) {
 	}(b.cli)
 
 	b.cron.Start()
-	_, _ = b.cron.AddFunc("@every 1m", b.Scan)
+	_, _ = b.cron.AddFunc(b.options.schedule, b.Scan)
 	b.log.Println("Started postgres backuper")
 	<-done
 	b.cron.Stop()
@@ -113,7 +126,7 @@ func (b *Backuper) DumpData(container types.Container) (types.HijackedResponse, 
 func (b *Backuper) UploadDump(appName string, reader *bufio.Reader) {
 	_, _ = reader.ReadBytes(0x1d) // Group Separator control character, discard data in first group
 	now := time.Now().Format(time.RFC3339)
-	info, err := b.minio.PutObject(b.ctx, "backups", fmt.Sprintf("%s/%s.sql", appName, now), reader, -1, minio.PutObjectOptions{})
+	info, err := b.minio.PutObject(b.ctx, b.options.minio.bucket, fmt.Sprintf("%s/%s.sql", appName, now), reader, -1, minio.PutObjectOptions{})
 	if err != nil {
 		b.log.Println("Failed to upload backup file for", appName, ":", err)
 	}
@@ -140,8 +153,15 @@ func Do(ctx *cli.Context) error {
 		Creds:  credentials.NewStaticV4(ctx.String("access-key"), ctx.String("secret-key"), ""),
 		Secure: ctx.Bool("use-ssl"),
 	}
-
-	backuper := NewBackuper(ctx.String("endpoint"), minioOptions)
+	options := &BackuperOptions{
+		schedule: ctx.String("schedule"),
+		minio: &MinioBackuperOptions{
+			endpoint:     ctx.String("endpoint"),
+			bucket:       ctx.String("bucket"),
+			minioOptions: minioOptions,
+		},
+	}
+	backuper := NewBackuper(options)
 	backuper.Run(done)
 	return nil
 }
@@ -152,6 +172,12 @@ func main() {
 		Usage:  "backup postgres containers to MinIO",
 		Action: Do,
 		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:     "schedule",
+				Usage:    "Schedule for backups",
+				Required: true,
+				EnvVars:  []string{"PB_SCHEDULE"},
+			},
 			&cli.StringFlag{
 				Name:     "endpoint",
 				Usage:    "MinIO endpoint",
