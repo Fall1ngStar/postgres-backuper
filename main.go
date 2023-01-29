@@ -1,7 +1,8 @@
 package main
 
 import (
-	"bufio"
+	"archive/tar"
+	"bytes"
 	"context"
 	"fmt"
 	"github.com/docker/docker/api/types"
@@ -9,14 +10,48 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/pkg/errors"
 	"github.com/robfig/cron/v3"
 	"github.com/urfave/cli/v2"
+	"io"
 	"log"
 	"os"
 	"os/signal"
 	"strings"
 	"time"
 )
+
+// https://github.com/cortexlabs/cortex/blob/dc5f73277d421c947129dc69a53597f196873f5e/pkg/lib/archive/tar.go#L79
+func UntarReaderToMem(reader io.Reader) (map[string][]byte, error) {
+	fileMap := map[string][]byte{}
+
+	tarReader := tar.NewReader(reader)
+
+	for {
+		header, err := tarReader.Next()
+
+		switch {
+		case err == io.EOF:
+			return fileMap, nil
+
+		case err != nil:
+			return nil, err
+
+		case header == nil:
+			continue
+		}
+
+		if header.Typeflag == tar.TypeReg {
+			contents, err := io.ReadAll(tarReader)
+			if err != nil {
+				return nil, errors.Wrap(err, "unable to extract tar file")
+			}
+
+			path := strings.TrimPrefix(header.Name, "/")
+			fileMap[path] = contents
+		}
+	}
+}
 
 func getAppName(container types.Container) (appName string) {
 	if value, ok := container.Labels["postgres-backup/app-name"]; ok {
@@ -66,6 +101,31 @@ func (b *Backuper) getDatabaseUser(container types.Container) string {
 		}
 	}
 	return "postgres"
+}
+
+func (b *Backuper) waitForExecToEnd(execID string) {
+	c := make(chan bool, 1)
+	go func() {
+		for {
+			inspect, err := b.cli.ContainerExecInspect(b.ctx, execID)
+			if err != nil {
+				c <- true
+			}
+			if !inspect.Running {
+				c <- true
+				return
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+	}()
+
+	select {
+	case <-time.After(30 * time.Second):
+		b.log.Println("Timed out waiting for exec", execID)
+		return
+	case <-c:
+		return
+	}
 }
 
 func registerExitHandler(done chan bool) {
@@ -146,28 +206,33 @@ func (b *Backuper) Scan() {
 	b.log.Println("End containers scan")
 }
 
-func (b *Backuper) DumpData(container types.Container, dbName, user string) (types.HijackedResponse, error) {
+func (b *Backuper) DumpData(container types.Container, dbName, user string) (io.ReadCloser, error) {
 	execResp, err := b.cli.ContainerExecCreate(b.ctx, container.ID, types.ExecConfig{
-		AttachStdout: true,
-		AttachStderr: true,
-		Cmd:          []string{"pg_dump", "-U", user, dbName},
+		Cmd:    []string{"bash", "-c", fmt.Sprintf("pg_dump -U %s %s > /tmp/dump.sql", user, dbName)},
+		Detach: false,
 	})
 	if err != nil {
-		return types.HijackedResponse{}, err
+		return nil, err
 	}
 
-	attachResp, err := b.cli.ContainerExecAttach(b.ctx, execResp.ID, types.ExecStartCheck{})
+	err = b.cli.ContainerExecStart(b.ctx, execResp.ID, types.ExecStartCheck{})
 	if err != nil {
-		return types.HijackedResponse{}, nil
+		return nil, err
 	}
+	b.waitForExecToEnd(execResp.ID)
 
-	return attachResp, nil
+	reader, _, err := b.cli.CopyFromContainer(b.ctx, container.ID, "/tmp/dump.sql")
+	if err != nil {
+		return nil, err
+	}
+	return reader, nil
 }
 
-func (b *Backuper) UploadDump(appName string, reader *bufio.Reader) {
-	//_, _ = reader.ReadBytes(0x1d) // Group Separator control character, discard data in first group
+func (b *Backuper) UploadDump(appName string, reader io.ReadCloser) {
+	defer reader.Close()
+	mem, err := UntarReaderToMem(reader)
 	now := time.Now().Format(time.RFC3339)
-	info, err := b.minio.PutObject(b.ctx, b.options.minio.bucket, fmt.Sprintf("%s/%s.sql", appName, now), reader, -1, minio.PutObjectOptions{})
+	info, err := b.minio.PutObject(b.ctx, b.options.minio.bucket, fmt.Sprintf("%s/%s.sql", appName, now), bytes.NewReader(mem["dump.sql"]), -1, minio.PutObjectOptions{})
 	if err != nil {
 		b.log.Println("Failed to upload backup file for", appName, ":", err)
 	}
@@ -184,7 +249,7 @@ func (b *Backuper) BackupContainer(container types.Container) {
 		log.Println("Failed to dump data for", container.ID[:12], ":", err)
 		return
 	}
-	b.UploadDump(appName, response.Reader)
+	b.UploadDump(appName, response)
 	b.log.Println("Finished backup for container", container.ID[:12])
 }
 
