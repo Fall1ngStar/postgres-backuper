@@ -14,17 +14,58 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 )
 
 func getAppName(container types.Container) (appName string) {
-	if value, ok := container.Labels[""]; ok {
+	if value, ok := container.Labels["postgres-backup/app-name"]; ok {
 		return value
 	}
 	if len(container.Names) > 0 {
 		return container.Names[0]
 	}
 	return container.ID[:12]
+}
+
+func (b *Backuper) getDatabaseName(container types.Container) string {
+	if value, ok := container.Labels["postgres-backup/db-name"]; ok {
+		return value
+	}
+	details, err := b.cli.ContainerInspect(b.ctx, container.ID)
+	if err != nil {
+		return "postgres"
+	}
+	for _, value := range details.Config.Env {
+		splits := strings.SplitN(value, "=", 2)
+		if len(splits) != 2 {
+			return "postgres"
+		}
+		if splits[0] == "POSTGRES_DB" {
+			return splits[1]
+		}
+	}
+	return "postgres"
+}
+
+func (b *Backuper) getDatabaseUser(container types.Container) string {
+	if value, ok := container.Labels["postgres-backup/db-user"]; ok {
+		return value
+	}
+	details, err := b.cli.ContainerInspect(b.ctx, container.ID)
+	if err != nil {
+		return "postgres"
+	}
+	for _, value := range details.Config.Env {
+		splits := strings.SplitN(value, "=", 2)
+		if len(splits) != 2 {
+			return "postgres"
+		}
+		if splits[0] == "POSTGRES_USER" {
+			return splits[1]
+		}
+	}
+	return "postgres"
 }
 
 func registerExitHandler(done chan bool) {
@@ -105,11 +146,11 @@ func (b *Backuper) Scan() {
 	b.log.Println("End containers scan")
 }
 
-func (b *Backuper) DumpData(container types.Container) (types.HijackedResponse, error) {
+func (b *Backuper) DumpData(container types.Container, dbName, user string) (types.HijackedResponse, error) {
 	execResp, err := b.cli.ContainerExecCreate(b.ctx, container.ID, types.ExecConfig{
 		AttachStdout: true,
 		AttachStderr: true,
-		Cmd:          []string{"pg_dump", "-U", "postgres"},
+		Cmd:          []string{"pg_dump", "-U", user, dbName},
 	})
 	if err != nil {
 		return types.HijackedResponse{}, err
@@ -124,7 +165,7 @@ func (b *Backuper) DumpData(container types.Container) (types.HijackedResponse, 
 }
 
 func (b *Backuper) UploadDump(appName string, reader *bufio.Reader) {
-	_, _ = reader.ReadBytes(0x1d) // Group Separator control character, discard data in first group
+	//_, _ = reader.ReadBytes(0x1d) // Group Separator control character, discard data in first group
 	now := time.Now().Format(time.RFC3339)
 	info, err := b.minio.PutObject(b.ctx, b.options.minio.bucket, fmt.Sprintf("%s/%s.sql", appName, now), reader, -1, minio.PutObjectOptions{})
 	if err != nil {
@@ -136,7 +177,9 @@ func (b *Backuper) UploadDump(appName string, reader *bufio.Reader) {
 func (b *Backuper) BackupContainer(container types.Container) {
 	b.log.Println("Starting backup for container", container.ID[:12])
 	appName := getAppName(container)
-	response, err := b.DumpData(container)
+	dbName := b.getDatabaseName(container)
+	user := b.getDatabaseUser(container)
+	response, err := b.DumpData(container, dbName, user)
 	if err != nil {
 		log.Println("Failed to dump data for", container.ID[:12], ":", err)
 		return
@@ -162,7 +205,11 @@ func Do(ctx *cli.Context) error {
 		},
 	}
 	backuper := NewBackuper(options)
-	backuper.Run(done)
+	if ctx.Bool("do") {
+		backuper.Scan()
+	} else {
+		backuper.Run(done)
+	}
 	return nil
 }
 
@@ -207,6 +254,11 @@ func main() {
 				Usage:   "Enable SSL for MinIO endpoint",
 				Value:   true,
 				EnvVars: []string{"PB_USE_SSL"},
+			},
+			&cli.BoolFlag{
+				Name:  "do",
+				Usage: "Execute the backuper now",
+				Value: false,
 			},
 		},
 		HideHelpCommand: true,
